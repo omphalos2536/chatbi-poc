@@ -1,0 +1,10 @@
+.env
+*.log
+*.out
+design-output.md
+__pycache__/
+node_modules/
+.venv/
+var/*
+!var/evidence/
+pipeline/logs/
