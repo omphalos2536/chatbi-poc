@@ -1,0 +1,367 @@
+{
+  "step": "02",
+  "build_sha": "bfee8cb697c494c238c02f1a7138a7951944ddf3eae8060ad49d49049e084c33",
+  "build_files": [
+    ".python-version",
+    "pyproject.toml",
+    "scripts/bootstrap",
+    "scripts/pg",
+    "src/chatbi/__init__.py",
+    "src/chatbi/cli.py",
+    "src/chatbi/config.py",
+    "src/chatbi/doctor.py",
+    "src/chatbi/evidence.py",
+    "src/chatbi/pglocal.py",
+    "tests/test_s01.py",
+    "tests/test_s02.py",
+    "uv.lock",
+    "config/gateway.yaml",
+    "src/chatbi/gateway/policy.py",
+    "src/chatbi/gateway/client.py",
+    "src/chatbi/gateway/server.py",
+    "src/chatbi/gateway/cli.py",
+    "src/chatbi/gateway/evidence.py",
+    "tests/test_s02.py"
+  ],
+  "batch_id": "none",
+  "operator": "box",
+  "timestamp": "2026-11-23T23:30:59Z",
+  "command": "chatbi evidence gateway",
+  "exit_code": 0,
+  "expected": "步骤 02 三条验收条件全部通过；实连在无凭据时只记 PENDING",
+  "observed": "4/4 条 PASS；live_state=pending_missing_key；审计记录 5 条、密钥泄漏 0 处",
+  "artifact": [
+    "var/evidence/gateway.json",
+    "var/run/chatbi-s02-ev-cx1b1v7s/gateway-audit.jsonl"
+  ],
+  "status": "PASS",
+  "cases": [
+    {
+      "case_id": "S02-AC1",
+      "command": "/workspace/chatbi-poc/.venv/bin/python -m pytest -q tests/test_s02.py -k payload",
+      "exit_code": 0,
+      "expected": "pytest 退出 0；mapping 与 query 各有成功例；哨兵（金额、客户名、原始错误、额外字段、密钥）在解码后的 messages 中出现 0 次",
+      "observed": "pytest: 4 passed, 13 deselected in 0.10s；mapping_ok=True query_ok=True sentinel_hits=0",
+      "artifact": [
+        "tests/test_s02.py",
+        "var/evidence/gateway.json"
+      ],
+      "status": "PASS",
+      "detail": {
+        "exit_code": 0,
+        "mapping_ok": true,
+        "query_ok": true,
+        "sentinel_hits": 0,
+        "pytest_summary": "4 passed, 13 deselected in 0.10s"
+      }
+    },
+    {
+      "case_id": "S02-AC2",
+      "command": "/workspace/chatbi-poc/.venv/bin/python -m pytest -q tests/test_s02.py -k transport",
+      "exit_code": 0,
+      "expected": "pytest 退出 0；拒绝换主机/跳转/未授权字段前出站 0 次；所有日志与审计 0 处密钥；chatbi gateway probe --mock 输出 MOCK_OK",
+      "observed": "pytest: 7 passed, 10 deselected in 0.32s；audit_records=3 audit_secret_leaks=0 probe_exit=0 probe='MOCK_OK transport=mock model=deepseek-v4.1-flash status=200 request_id=2f2aa80f2f39bca2' audit_fields_missing=[]",
+      "artifact": [
+        "tests/test_s02.py",
+        "var/run/chatbi-s02-ev-cx1b1v7s/gateway-audit.jsonl",
+        "var/evidence/gateway.json"
+      ],
+      "status": "PASS",
+      "detail": {
+        "exit_code": 0,
+        "probe_exit_code": 0,
+        "probe_first_line": "MOCK_OK transport=mock model=deepseek-v4.1-flash status=200 request_id=2f2aa80f2f39bca2",
+        "audit_records": 3,
+        "audit_secret_leaks": 0,
+        "audit_fields_missing": [],
+        "pytest_summary": "7 passed, 10 deselected in 0.32s"
+      }
+    },
+    {
+      "case_id": "S02-AC3",
+      "command": "chatbi gateway probe --live --json",
+      "exit_code": 2,
+      "expected": "有 CHATBI_LLM_API_KEY 时退出 0、输出 LIVE_OK、模型 deepseek-v4.1-flash 与可解析内容及请求时间；缺凭据时退出非零并记“实连待验”（PENDING）",
+      "observed": "环境变量 CHATBI_LLM_API_KEY 未设置：exit=2，输出 LIVE_KEY_MISSING，实连待验（PENDING）；输出含密钥=False",
+      "artifact": [
+        "var/run/chatbi-s02-ev-cx1b1v7s/gateway-audit.jsonl",
+        "var/evidence/gateway.json"
+      ],
+      "status": "PASS",
+      "live_state": "pending_missing_key",
+      "secret_present": false,
+      "detail": {
+        "first_line": "LIVE_KEY_MISSING 实连待验：环境变量 CHATBI_LLM_API_KEY 未设置；离线步骤可继续（可先运行 chatbi gateway probe --mock）"
+      }
+    },
+    {
+      "case_id": "S02-OFFLINE-HEALTHCHECK",
+      "command": "chatbi gateway probe --healthcheck --json",
+      "exit_code": 0,
+      "expected": "有密钥时发出最小真实请求并记录状态码；无密钥时用本地探针，不伪造成功",
+      "observed": "HEALTHCHECK_OK query_status=200 query_error=response_invalid mapping_error=response_invalid outbound=2",
+      "artifact": [
+        "var/run/chatbi-s02-ev-cx1b1v7s/gateway-audit.jsonl"
+      ],
+      "status": "PASS",
+      "detail": {
+        "mode": "healthcheck",
+        "synthetic_credential": true,
+        "query": {
+          "request_id": "c2e377925a987f4d",
+          "purpose": "query",
+          "model": "deepseek-v4.1-flash",
+          "system_version": "s02.1",
+          "http_status": 200,
+          "elapsed_ms": 2,
+          "attempts": 1,
+          "outbound": 1,
+          "transport": "live",
+          "dictionary_digest": "26a7fc657923514340e8de7b91b89e0ff0793ef4f9cb7ad48d690cfd490a9802",
+          "dictionary_keys": [
+            "fields",
+            "views"
+          ],
+          "fingerprint": "",
+          "usage": {
+            "prompt_tokens": null,
+            "completion_tokens": null,
+            "total_tokens": null
+          },
+          "ok": false,
+          "redaction": {
+            "redactions": 2,
+            "categories": {
+              "参数": 2
+            },
+            "parameters": []
+          },
+          "error": {
+            "kind": "response_invalid",
+            "message": "响应缺少 choices[0]",
+            "detail": {
+              "code": "no_choices"
+            }
+          }
+        },
+        "mapping": {
+          "request_id": "399d92b72b64ea82",
+          "purpose": "mapping",
+          "model": "deepseek-v4.1-flash",
+          "system_version": "s02.1",
+          "http_status": 200,
+          "elapsed_ms": 0,
+          "attempts": 1,
+          "outbound": 2,
+          "transport": "live",
+          "dictionary_digest": "0e2a12c7dfdb16f52c97221c6581cf202b1a2c31530fe2e169028183c7b38405",
+          "dictionary_keys": [
+            "notes",
+            "source_tables",
+            "standard_fields",
+            "units"
+          ],
+          "fingerprint": "",
+          "usage": {
+            "prompt_tokens": null,
+            "completion_tokens": null,
+            "total_tokens": null
+          },
+          "ok": false,
+          "redaction": {
+            "redactions": 0,
+            "categories": {},
+            "parameters": []
+          },
+          "error": {
+            "kind": "response_invalid",
+            "message": "响应缺少 choices[0]",
+            "detail": {
+              "code": "no_choices"
+            }
+          }
+        },
+        "outbound": 2
+      },
+      "synthetic_credential": true
+    }
+  ],
+  "gateway": {
+    "config": {
+      "source": "config/gateway.yaml",
+      "raw_sha256": "19465218fb0370ce31cdfa3ea4849d2ca383c18d54a1a06883a3713dcdc80888",
+      "endpoint": {
+        "base_url": "https://api3.kkyy.site/v1",
+        "path": "/chat/completions",
+        "model": "deepseek-v4.1-flash"
+      },
+      "transport": {
+        "timeout_seconds": 20.0,
+        "follow_redirects": false,
+        "proxy_from_env": false,
+        "verify": true
+      },
+      "limits": {
+        "response_bytes": 65536,
+        "content_bytes": 16384,
+        "dictionary_bytes": 16384,
+        "request_bytes": 49152
+      },
+      "retry": {
+        "max_attempts": 3,
+        "backoff_seconds": [
+          1.0,
+          2.0
+        ]
+      },
+      "key_env": "CHATBI_LLM_API_KEY",
+      "system_version": "s02.1",
+      "purposes": {
+        "mapping": [
+          "notes",
+          "source_tables",
+          "standard_fields",
+          "units"
+        ],
+        "query": [
+          "examples",
+          "fields",
+          "metrics",
+          "relations",
+          "views"
+        ]
+      },
+      "callers": {
+        "mapping": {
+          "purpose": "mapping",
+          "dictionary_keys": [
+            "notes",
+            "source_tables",
+            "standard_fields",
+            "units"
+          ]
+        },
+        "mapping-confirmer": {
+          "purpose": "mapping",
+          "dictionary_keys": [
+            "notes",
+            "source_tables",
+            "standard_fields",
+            "units"
+          ]
+        },
+        "query": {
+          "purpose": "query",
+          "dictionary_keys": [
+            "examples",
+            "fields",
+            "metrics",
+            "relations",
+            "views"
+          ]
+        },
+        "query-longtail": {
+          "purpose": "query",
+          "dictionary_keys": [
+            "examples",
+            "fields",
+            "metrics",
+            "relations",
+            "views"
+          ]
+        },
+        "query-selfcheck": {
+          "purpose": "query",
+          "dictionary_keys": [
+            "examples",
+            "fields",
+            "metrics",
+            "relations",
+            "views"
+          ]
+        },
+        "live-probe": {
+          "purpose": "query",
+          "dictionary_keys": [
+            "examples",
+            "fields",
+            "metrics",
+            "relations",
+            "views"
+          ]
+        }
+      }
+    },
+    "endpoint": "https://api3.kkyy.site/v1/chat/completions",
+    "model": "deepseek-v4.1-flash",
+    "key_env": "CHATBI_LLM_API_KEY",
+    "secret_present": false,
+    "live_state": "pending_missing_key",
+    "audit_records": 5,
+    "audit_secret_leaks": 0,
+    "audit_fields": [
+      "attempts",
+      "caller",
+      "completion_tokens",
+      "content_bytes",
+      "dictionary_digest",
+      "dictionary_keys",
+      "duration_ms",
+      "error_code",
+      "error_kind",
+      "fingerprint",
+      "http_status",
+      "model",
+      "prompt_tokens",
+      "purpose",
+      "question_digest",
+      "redaction_categories",
+      "redactions",
+      "request_bytes",
+      "request_id",
+      "response_bytes",
+      "status",
+      "system_version",
+      "total_tokens",
+      "transport",
+      "ts"
+    ],
+    "audit_sample": {
+      "attempts": 1,
+      "caller": "live",
+      "completion_tokens": null,
+      "content_bytes": 0,
+      "dictionary_digest": "0e2a12c7dfdb16f52c97221c6581cf202b1a2c31530fe2e169028183c7b38405",
+      "dictionary_keys": [
+        "notes",
+        "source_tables",
+        "standard_fields",
+        "units"
+      ],
+      "duration_ms": 0,
+      "error_code": "no_choices",
+      "error_kind": "response_invalid",
+      "fingerprint": null,
+      "http_status": 200,
+      "model": "deepseek-v4.1-flash",
+      "prompt_tokens": null,
+      "purpose": "mapping",
+      "question_digest": "fd046c363a7ea4b0833fa228c87dc3dd393d42bd0e64e5a9d03a561eaa79a9d3",
+      "redaction_categories": {},
+      "redactions": 0,
+      "request_bytes": 1664,
+      "request_id": "399d92b72b64ea82",
+      "response_bytes": 15,
+      "status": "invalid",
+      "system_version": "s02.1",
+      "total_tokens": null,
+      "transport": "live",
+      "ts": "2026-11-23T23:30:59Z"
+    }
+  },
+  "notes": [
+    "batch_id: none —— 网关步骤尚无导入批次。",
+    "所有密钥相关结论都以“值是否出现”的布尔表示；本文件与审计都不含密钥值。",
+    "payload 捕获只发生在合成数据的假传输里；真实调用不保存请求正文。"
+  ]
+}

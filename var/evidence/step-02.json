@@ -1,0 +1,93 @@
+{
+  "step": "02",
+  "attempt": 1,
+  "build_sha": "932b486148791b2c5a8357fef87bb586b04f26fe62098c118b601359f5abf00a",
+  "git_head": "ec1f5ef88d44892d56a8f73601e4ecb858267d18",
+  "batch_id": "none",
+  "operator": "Codex acceptance agent",
+  "timestamp": "2026-11-24T07:35:41+08:00",
+  "case_id": "S02-ATTEMPT-1",
+  "command": "timeout 300 .venv/bin/pytest -q tests/test_s02.py -k payload; timeout 300 .venv/bin/pytest -q tests/test_s02.py -k transport; timeout 120 .venv/bin/chatbi gateway probe --mock; timeout 120 .venv/bin/chatbi gateway probe --live",
+  "exit_code": 0,
+  "expected": "Step 02 AC1-AC3 pass, including a successful real live probe when CHATBI_LLM_API_KEY is present",
+  "observed": "AC1 4 passed; AC2 7 passed; mock probe MOCK_OK; live probe LIVE_OK with HTTP 200, configured model, parseable content and request timing; full suite 17 passed; secret evidence scan found 0 hits",
+  "artifact": "reviews/step-02-模型网关-attempt-1.md",
+  "status": "PASS",
+  "environment": {
+    "host": "grok-bot-vm-193309795",
+    "kernel": "Linux 6.12.113+ x86_64",
+    "python": "3.13.5",
+    "pytest": "8.4.1",
+    "httpx": "0.28.1",
+    "postgres": "17.12 (not started; Step 02 does not use PostgreSQL)",
+    "model": "deepseek-v4.1-flash",
+    "credential_present": true,
+    "credential_value_recorded": false,
+    "worktree": "dirty; Step 02 delivery files are uncommitted, so build_sha is the SHA-256 of the sorted relevant-file hash manifest"
+  },
+  "cases": [
+    {
+      "case_id": "S02-AC1",
+      "command": "timeout 300 .venv/bin/pytest -q tests/test_s02.py -k payload",
+      "exit_code": 0,
+      "expected": "Payload tests pass; mapping and query each succeed; all forbidden synthetic sentinels occur zero times in decoded messages",
+      "observed": "4 passed, 13 deselected in 0.10s; assertions verify both purpose success cases and zero sentinel/key occurrences",
+      "artifact": "var/evidence/step-02-attempt-1/ac1-payload.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-AC2-TEST",
+      "command": "timeout 300 .venv/bin/pytest -q tests/test_s02.py -k transport",
+      "exit_code": 0,
+      "expected": "Transport tests pass; host changes, redirects and unauthorized fields are refused; pre-contract rejections have zero outbound calls; logs contain no key",
+      "observed": "7 passed, 10 deselected in 0.28s",
+      "artifact": "var/evidence/step-02-attempt-1/ac2-transport.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-AC2-MOCK",
+      "command": "timeout 120 .venv/bin/chatbi gateway probe --mock",
+      "exit_code": 0,
+      "expected": "Exit 0 and print MOCK_OK",
+      "observed": "MOCK_OK transport=mock model=deepseek-v4.1-flash status=200",
+      "artifact": "var/evidence/step-02-attempt-1/ac2-probe-mock.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-AC3",
+      "command": "timeout 120 .venv/bin/chatbi gateway probe --live",
+      "exit_code": 0,
+      "expected": "With credential present, exit 0 and print LIVE_OK, configured model, parseable content, HTTP status and request time",
+      "observed": "LIVE_OK; model=deepseek-v4.1-flash; configured_model=deepseek-v4.1-flash; http_status=200; content_parsed=True; elapsed_ms=27052; usage tokens present",
+      "artifact": "var/evidence/step-02-attempt-1/ac3-probe-live.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-INDEPENDENT-NEGATIVE",
+      "command": "timeout 120 env -u CHATBI_LLM_API_KEY .venv/bin/chatbi gateway probe --live",
+      "exit_code": 2,
+      "expected": "Without credential, exit nonzero, print LIVE_KEY_MISSING and never print LIVE_OK",
+      "observed": "Exit 2; LIVE_KEY_MISSING printed; LIVE_OK absent",
+      "artifact": "var/evidence/step-02-attempt-1/independent-negative-missing-key.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-FULL-SUITE",
+      "command": "timeout 300 .venv/bin/pytest -q tests/test_s02.py",
+      "exit_code": 0,
+      "expected": "All Step 02 tests pass with no skips or xfails",
+      "observed": "17 passed in 9.95s",
+      "artifact": "var/evidence/step-02-attempt-1/full-suite.txt",
+      "status": "PASS"
+    },
+    {
+      "case_id": "S02-SECRET-SCAN",
+      "command": "Scan attempt evidence bytes for the environment credential without printing its value",
+      "exit_code": 0,
+      "expected": "Zero evidence files contain the credential value",
+      "observed": "6 files scanned; 0 hits",
+      "artifact": "var/evidence/step-02-attempt-1/",
+      "status": "PASS"
+    }
+  ]
+}

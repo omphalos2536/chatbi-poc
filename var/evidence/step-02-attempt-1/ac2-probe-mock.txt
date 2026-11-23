@@ -1,0 +1,3 @@
+MOCK_OK transport=mock model=deepseek-v4.1-flash status=200 request_id=8301dde11c918844
+
+EXIT_CODE=0

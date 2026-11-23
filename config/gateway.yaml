@@ -1,0 +1,116 @@
+# 模型网关配置（步骤 02）。只描述“出口契约”，不含任何凭据。
+#
+# 密钥只从环境变量 CHATBI_LLM_API_KEY 读取（值不落盘、不进日志、不进证据）。
+# URL、模型名、system 版本、大小上限、超时和并发都在这里固定；调用方（客户端、
+# 本地 socket 服务、网页后端）都不能在请求里指定 URL、密钥或任意消息。
+
+version: 2
+
+endpoint:
+  # 唯一允许的外发地址；只向 <base_url>/chat/completions 发 POST。
+  base_url: "https://api3.kkyy.site/v1"
+  path: "/chat/completions"
+  model: "deepseek-v4.1-flash"
+  temperature: 0
+  max_tokens: 1200
+
+transport:
+  # httpx 客户端：跟随重定向关闭；代理由下方 proxy_from_env 决定。
+  timeout_seconds: 20.0
+  connect_timeout_seconds: 5.0
+  follow_redirects: false
+  # false：显式 trust_env=False，不读 HTTP(S)_PROXY 等代理变量，防止请求被导到别处。
+  proxy_from_env: false
+  # 传输层只对连接前的暂时性失败（连接建立失败/超时/临时 DNS）重试 1 次；
+  # HTTP 429/5xx 不做 SDK 式自动重试（预算由 client 控制），可在下面微调。
+  transient_connect_retries: 1
+  verify: true
+
+aiolimits:
+  max_connections: 2
+  max_keepalive_connections: 1
+
+# 响应与本地结构（含候选 SQL）的大小上限，超出即拒收。
+limits:
+  response_bytes: 65536            # 原始 HTTP 响应体：64 KiB
+  content_bytes: 16384             # choices[0].message.content：16 KiB（建议值）
+  dictionary_bytes: 16384          # 单个用途的授权字典：16 KiB
+  question_bytes: 2048             # 脱敏后的问句：2 KiB
+  request_bytes: 49152             # 重建后的请求体：48 KiB
+  json_depth: 12
+
+# 每次调用的预算：最多 1 次请求 + 至多 2 次退避重试（429 / 暂时性 5xx / 超时）。
+retry:
+  max_attempts: 3
+  backoff_seconds: [1.0, 2.0]
+
+# 密钥变量名（只写变量名）。
+credential:
+  env: "CHATBI_LLM_API_KEY"
+
+# 本地网关服务：私有 Unix socket，调用方按用途授权。
+server:
+  socket: "var/run/gateway.sock"
+  max_connections: 4
+  request_timeout_seconds: 60.0
+
+# 本地配置限定：哪些本地用途可以使用网关，以及各自允许的字典键。
+# 键名是“调用方用途标识”，值是用途类型 + 允许的字典顶层键。
+callers:
+  mapping:
+    purpose: mapping
+    dictionary_keys: [source_tables, standard_fields, units, notes]
+  mapping-confirmer:
+    purpose: mapping
+    dictionary_keys: [source_tables, standard_fields, units, notes]
+  query:
+    purpose: query
+    dictionary_keys: [views, fields, relations, metrics, examples]
+  query-longtail:
+    purpose: query
+    dictionary_keys: [views, fields, relations, metrics, examples]
+  query-selfcheck:
+    purpose: query
+    dictionary_keys: [views, fields, relations, metrics, examples]
+  live-probe:
+    purpose: query
+    dictionary_keys: [views, fields, relations, metrics, examples]
+
+# 版本化静态 system 指令。占位符 {purpose} 在发出前替换；内容不含任何数据值。
+system:
+  version: "s02.1"
+  # 文本块可写 {{version}}，加载时替换为上面的 system.version。
+  mapping: |
+    你是企业数据导入流程中的“字段映射助手”V{{version}}。
+    输入只有两部分：一条固定格式的映射任务说明（question）和一份已由数据负责人审核、允许出域的字典（dictionary）。
+    你的唯一任务是：在 dictionary.source_tables 中，为 dictionary.standard_fields 的每个标准字段给出候选源表头。
+    规则：
+    1. 只依据 dictionary 里的内容判断；不得臆造表名、表头、单位或字段。
+    2. 每个候选必须能在 dictionary.source_tables 的表头中出现（表名 + 表头原文）。
+    3. 单位必须取自 dictionary.units；不确定就留空字符串。
+    4. 每个标准字段给出 0–3 个候选，按把握度从高到低；没有把握就给空列表，并写 reason。
+    5. 你只提出候选，最终由人工确认；不得输出任何与任务无关的内容。
+    只输出一个 JSON 对象，不要 Markdown 代码块，不要多余文字：
+    {"candidates":[{"standard_field":"","source_table":"","source_header":"","unit":"","confidence":0.0,"reason":""}],"notes":""}
+  query: |
+    你是企业问数系统中的“SQL 生成助手”V{{version}}。
+    输入只有两部分：一条已脱敏的问题（question，参数以 :p1、:p2 这样的占位符出现）和一份已授权的字典（dictionary：视图、字段、关系、口径与无值示例）。
+    规则：
+    1. 只能使用 dictionary.views 中的视图和 dictionary.fields 中属于该视图的列；只能使用 dictionary.relations 中声明的关系做连接。
+    2. 只生成一条只读 SELECT（或 WITH ... SELECT）；禁止任何写操作、DDL、函数调用副作用、系统表或目录查询。
+    3. 问题中的参数以 :pN 占位符出现时，SQL 里也必须原样使用这些占位符，不得自行填值。
+    4. 口径按 dictionary.metrics 的定义计算；需要分组或排序时给出明确的 ORDER BY。
+    5. 无法在字典范围内回答时，输出 status 为 "clarify"（缺少哪些字段）或 "unsupported"，并在 reason 说明；不要编造字段或数值。
+    只输出一个 JSON 对象，不要 Markdown 代码块，不要多余文字：
+    {"status":"ok","sql":"SELECT ...","params":["p1"],"output_columns":[{"name":"","unit":""}],"reason":""}
+    或 {"status":"clarify","missing":[""],"reason":""} / {"status":"unsupported","reason":""}
+
+# 纠错：步骤 12 使用这两类固定指令（此处只登记版本与类别；本轮不调用）。
+repair:
+  version: "s02.1"
+  categories:
+    - json_invalid
+    - sql_syntax
+    - unknown_column
+    - group_by
+    - type_mismatch

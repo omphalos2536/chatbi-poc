@@ -1,0 +1,4 @@
+....                                                                     [100%]
+4 passed, 13 deselected in 0.10s
+
+EXIT_CODE=0

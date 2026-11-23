@@ -35,6 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence_sub = evidence.add_subparsers(dest="evidence_target", metavar="<target>")
     evidence_sub.add_parser("env", help="环境证据：版本、资源、依赖、PG 连接、目录权限")
+    evidence_sub.add_parser(
+        "gateway",
+        help="网关证据：var/evidence/gateway.json（步骤 02）",
+    )
+
+    # 步骤 02：模型网关（子命令注册在 chatbi.gateway.cli）。
+    from chatbi.gateway import cli as gateway_cli
+
+    gateway_cli.add_parser(sub)
     return parser
 
 
@@ -54,8 +63,19 @@ def main(argv: list[str] | None = None) -> int:
             info = evidence.build_env_evidence()
             print(f"status={info['status']} build_sha={info['build_sha'][:16]}...")
             return 0 if info["status"] == "PASS" else 1
+        if args.evidence_target == "gateway":
+            from chatbi.gateway import evidence as gateway_evidence
+
+            path, status = gateway_evidence.write_gateway_evidence()
+            print(f"证据已写入 {path}")
+            print(f"status={status}")
+            return 0 if status == "PASS" else 1
         parser.print_help(sys.stderr)
         return 2
+    if args.command == "gateway":
+        from chatbi.gateway import cli as gateway_cli
+
+        return gateway_cli.run(args)
     parser.print_help()
     return 2
 

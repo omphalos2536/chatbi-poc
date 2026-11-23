@@ -1,0 +1,3 @@
+LIVE_KEY_MISSING 实连待验：环境变量 CHATBI_LLM_API_KEY 未设置；离线步骤可继续（可先运行 chatbi gateway probe --mock）
+
+EXIT_CODE=2
