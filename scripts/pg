@@ -1,0 +1,851 @@
+#!/usr/bin/env bash
+# 私有 PostgreSQL 17.12 实例（普通用户运行、独立目录、私有 Unix socket）。
+#
+#   scripts/pg init     下载并校验 17.12 服务器包（如需）、解包、initdb、建库与角色
+#   scripts/pg start    校验 data_directory 与自己的 pid 后启动
+#   scripts/pg status   打印运行状态、库标识与关键参数
+#   scripts/pg sql 'SQL' 经 psql -XAt、ON_ERROR_STOP 在 chatbi 库执行
+#   scripts/pg stop     停止（并等待 postmaster 退出）
+#   scripts/pg reset    仅空库重建：需 CHATBI_PG_EXPECT_CLUSTER=<旧标识> + --force-loss
+#   scripts/pg dist     只做下载、校验哈希、解包与版本检查
+#   scripts/pg passfile 打印口令文件路径（不打印口令）
+#   scripts/pg password --role R  为分发或轮换角色口令（唯一会输出口令的子命令，
+#                        stdout 只含口令，供管道的消费方使用；日志写 stderr）
+#   scripts/pg which    打印各二进制路径（JSON）
+#
+#   CHATBI_PG_EXPECT_CLUSTER=<id> 作为环境变量时，已有集群的标识必须与之一致。
+# 布局：软件 var/pg/dist，集群 var/pg/data（两者分开）；socket 在 var/run/pg
+# （短绝对路径，0700）；端口默认 55432，listen_addresses=''；编码 UTF8、locale C；
+# 本地认证 SCRAM-SHA-256，口令只存于 var/run/secrets 下 0600 的 pgpass。
+# 任何输出和日志都不包含口令；不会触碰系统集群或其它数据目录。
+set -euo pipefail
+
+ROOT=/workspace/chatbi-poc
+cd "$ROOT"
+
+# ---------------------------------------------------------------- 固定常量 --
+PG_DEB_NAME="postgresql-17_17.12-0+deb13u1_amd64.deb"
+PG_DEB_URL="https://deb.debian.org/debian/pool/main/p/postgresql-17/${PG_DEB_NAME}"
+PG_DEB_SHA256="72443dcedfa0bdfa79dafdf414c18498b89929eeee1555e987c87154f3082fea"
+PG_MAJOR=17
+PG_EXPECTED_VERSION="17.12"
+PG_EXPECTED_NUM=170012
+PG_PORT=55432
+PG_LISTEN="''"                 # listen_addresses='' ：只走 Unix socket
+PG_OWNER="chatbi_owner"        # initdb 超管（唯一超级用户）
+PG_DB="chatbi"
+PG_SOCKDIR="$ROOT/var/run/pg"
+PG_SVC_ROLE="chatbi_svc"       # `scripts/pg sql` 的默认连接角色
+
+# ---------------------------------------------------------------- 目录布局 --
+PG_ROOT="$ROOT/var/pg"
+PG_DIST="$PG_ROOT/dist"
+PG_DATA="$PG_ROOT/data"
+PG_BIN="$PG_DIST/usr/lib/postgresql/$PG_MAJOR/bin"
+PG_SHARE="$PG_DIST/usr/share/postgresql/$PG_MAJOR"
+PG_DEB="$PG_ROOT/server.deb"
+PG_STATE="$PG_ROOT/cluster.env"          # 超管角色名与库名（不含口令）
+PG_SPEC="$PG_ROOT/spec.sha256"           # 初始化参数指纹
+PG_PASS="$ROOT/var/run/secrets/pgpass"     # 管理员口令（psql -w 用）
+PG_PASS_SVC="$ROOT/var/run/secrets/pgpass-svc"   # 服务角色口令
+PG_LOG="$ROOT/var/run/pg/log"            # initdb / pg_ctl / 启动诊断（仅属主可读）
+
+export PATH="$PG_BIN:$PATH"
+
+log() { printf '[pg] %s\n' "$*" >&2; }
+# 诊断日志只追加；创建时 0600。日志里只有路径与通用错误，不含口令。
+touch_log() { [ -f "$PG_LOG" ] || ( umask 077; : > "$PG_LOG" ); }
+die() { printf '[pg] ERROR: %s\n' "$*" >&2; exit 1; }
+have() { [ -x "$PG_BIN/$1" ]; }
+check_layout_safety() {
+  local real_root real_data
+  real_root="$(realpath -m "$ROOT")"
+  [ "$real_root" = "/" ] && die "拒绝在根目录运行"
+  real_data="$(realpath -m "$PG_DATA")"
+  case "$real_data" in
+    "$real_root"/var/pg/data) ;;
+    *) die "data_directory 解析异常：$real_data" ;;
+  esac
+  case "$real_data" in
+    /var/lib/postgresql*|/usr/*|/etc/*) die "拒绝使用系统数据目录：$real_data" ;;
+  esac
+}
+
+# ------------------------------------------------------------ 二进制准备 --
+verify_deb() {
+  [ -f "$PG_DEB" ] || die "缺少 $PG_DEB，请先运行 scripts/pg dist"
+  local got
+  got="$(sha256sum "$PG_DEB" | cut -d' ' -f1)"
+  if [ "$got" != "$PG_DEB_SHA256" ]; then
+    die "服务器包 SHA-256 不符：期望 $PG_DEB_SHA256 实际 $got（文件 $PG_DEB）"
+  fi
+}
+
+download_deb() {
+  mkdir -p "$PG_ROOT"; chmod 0700 "$PG_ROOT"
+  if [ -f "$PG_DEB" ] && [ "$(sha256sum "$PG_DEB" | cut -d' ' -f1)" = "$PG_DEB_SHA256" ]; then
+    log "已存在且哈希一致的服务器包：$PG_DEB"
+    return 0
+  fi
+  log "下载 $PG_DEB_URL"
+  local tmp="$PG_DEB.part"
+  rm -f "$tmp"
+  curl -fLsS --retry 3 -o "$tmp" "$PG_DEB_URL" || { rm -f "$tmp"; die "下载失败：$PG_DEB_URL"; }
+  local got; got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  if [ "$got" != "$PG_DEB_SHA256" ]; then
+    rm -f "$tmp"
+    die "下载包 SHA-256 不符：期望 $PG_DEB_SHA256 实际 $got"
+  fi
+  mv -f "$tmp" "$PG_DEB"
+  log "SHA-256 校验通过"
+}
+
+dist_ready() {
+  # 客户端：系统 psql 17.12 已安装（仅客户端）；解包目录里没有 psql。
+  have postgres && have initdb && have pg_ctl && command -v psql >/dev/null \
+    && [ -f "$PG_SHARE/postgres.bki" ]
+}
+
+ensure_dist() {
+  if ! dist_ready; then
+    if [ -d "$PG_DIST/usr/lib/postgresql/$PG_MAJOR" ] || [ -d "$PG_DIST/usr" ]; then
+      [ -f "$PG_SHARE/postgres.bki" ] || die "解包目录不完整：$PG_DIST（请人工清理后重跑 scripts/pg dist）"
+    else
+      download_deb
+      log "dpkg-deb -x 解包到 $PG_DIST"
+      mkdir -p "$PG_DIST"
+      dpkg-deb -x "$PG_DEB" "$PG_DIST"
+    fi
+  fi
+  local ver
+  ver="$("$PG_BIN/postgres" --version 2>/dev/null | sed -E 's/^[^0-9]*([0-9]+\.[0-9]+).*/\1/')"
+  [ "$ver" = "$PG_EXPECTED_VERSION" ] || die "服务器版本 $ver != 期望 $PG_EXPECTED_VERSION"
+  log "服务器二进制：$PG_BIN（$("$PG_BIN/postgres" --version)）"
+}
+
+# ------------------------------------------------------------- 集群标识 --
+cluster_id_file() { printf '%s/CHATBI_CLUSTER' "$PG_DATA"; }
+
+data_directory_ok() {
+  [ -f "$PG_DATA/PG_VERSION" ] || return 1
+  [ "$(cat "$PG_DATA/PG_VERSION" 2>/dev/null)" = "$PG_MAJOR" ] || return 1
+  return 0
+}
+
+read_state() {
+  [ -f "$PG_STATE" ] || return 1
+  # shellcheck disable=SC1090
+  . "$PG_STATE"
+}
+
+# 该数据目录是否由本脚本初始化（防止误启他人集群）。
+is_our_cluster() {
+  data_directory_ok || return 1
+  [ -f "$(cluster_id_file)" ] || return 1
+  read_state || return 1
+  [ "$(realpath -m "$DATA_DIRECTORY")" = "$(realpath -m "$PG_DATA")" ] || return 1
+  return 0
+}
+
+running_pid() {
+  local pidfile="$PG_DATA/postmaster.pid" pid
+  [ -f "$pidfile" ] || return 1
+  pid="$(head -n1 "$pidfile" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  # pid 文件的第二行必须是本数据目录；再按命令行确认（看得到时）。看不到命令行
+  # 不等于“没在运行”（受限会话只暴露本会话进程），交给 socket 连接判断。
+  [ "$(sed -n '2p' "$pidfile")" = "$PG_DATA" ] || return 1
+  if pid_visible "$pid"; then
+    pid_is_this_datadir "$pid" || return 1
+  fi
+  printf '%s\n' "$pid"
+}
+
+# argv 逐项比较：同时出现 "-D" 与 数据目录 两项才算本实例的 postmaster，
+# 避免 "/x/var/pg/data-old" 这类前缀路径被误认，也避免 kill(0) 的 PID 复用误判。
+pid_is_this_datadir() { # $1=pid
+  local cmd="/proc/$1/cmdline"
+  [ -r "$cmd" ] || return 1
+  tr '\0' '\n' < "$cmd" | awk -v d="$PG_DATA" '
+    prev == "-D" && $0 == d { found = 1 }
+    { prev = $0 }
+    END { exit found ? 0 : 1 }'
+}
+
+# 本会话能否看到该进程的 /proc 条目。
+pid_visible() {
+  [ -d "/proc/$1" ] || return 1
+  kill -0 "$1" 2>/dev/null
+}
+
+# 本实例是否真的在接受连接（唯一可靠的“在运行”判据，跨会话也成立）。
+instance_up() {
+  run_as "$PG_PASS" "$PG_OWNER" postgres -c 'select 1' >/dev/null 2>&1
+}
+
+# 端口锁文件（.s.PGSQL.<port>.lock）里记录的 PID 若仍存活且确实是本数据目录
+# 的 postmaster，可以直接复用（postmaster.pid 被误删时）；其它情况交给上面的
+# socket 连接判断，由 start 决定清理残留。锁文件每行一项：PID、可选数据目录、
+# 共享内存键、端口号、socket 目录；受限会话里 PID 可能串号，因此还核对锁里
+# 出现的数据目录（第一个绝对路径）必须指向本集群。
+port_lock_pid() {
+  local lock="$PG_SOCKDIR/.s.PGSQL.$PG_PORT.lock" pid datadir
+  [ -f "$lock" ] || return 1
+  pid="$(sed -n 1p "$lock" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$pid" ] || return 1
+  datadir="$(sed -n 's|^\(/.*\)$|\1|p' "$lock" | sed -n 1p)"
+  [ -z "$datadir" ] || [ "$(realpath -m "$datadir")" = "$(realpath -m "$PG_DATA")" ] \
+    || { printf '%s\n' 'other-datadir'; return 0; }
+  printf '%s\n' "$pid"
+}
+
+# 实例不在监听时，端口锁的主人是否仍可确认是本实例的 postmaster。
+# 输出 LIVE:<pid> 表示可复用；空表示可以清理残留；other-* 表示外部占用。
+foreign_listener() {
+  local pid
+  pid="$(port_lock_pid || true)"
+  case "$pid" in
+    other-*) printf '%s\n' "$pid"; return 0 ;;
+    '') return 0 ;;
+  esac
+  if pid_visible "$pid" && pid_is_this_datadir "$pid"; then
+    printf 'LIVE:%s\n' "$pid"
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------- 口令文件 --
+# 只用 /dev/urandom，避免依赖外部程序；32 字节 base64，仅字母数字与 +/。
+gen_secret() {
+  local s
+  s="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+  [ ${#s} -eq 32 ] || die "无法生成足够长度的口令"
+  printf '%s\n' "$s"
+}
+
+
+# 写入 pgpass（POSTGRES_PASSWORD_FILE 的格式：SQL 里要的口令单独一行），0600。
+# 角色用文件名区分：pgpass 对应 initdb 超管，pgpass-svc 对应服务角色。
+# 口令只用 ASCII（32 位字母数字），避免多字节字符在转义时产生非法 UTF-8。
+write_passfile() {
+  local path=$1; shift
+  local tmp="${path}.tmp.$$" line role pass
+  mkdir -p "$(dirname "$path")"; chmod 0700 "$(dirname "$path")"
+  umask 077
+  : > "$tmp"; chmod 0600 "$tmp"
+  while [ $# -gt 0 ]; do
+    role=$1; pass=$2; shift 2
+    [ -n "$role" ] && [ -n "$pass" ] || die "口令文件条目为空：$path"
+    printf '%s\n' "$pass" >> "$tmp"
+  done
+  mv -f "$tmp" "$path"
+  chmod 0600 "$path"
+}
+
+# 读取某个口令文件（第一行）里的口令；文件不存在或为空时返回 1。
+read_pass() {
+  local path=$1 line
+  [ -f "$path" ] || return 1
+  IFS= read -r line < "$path" || [ -n "$line" ] || return 1
+  [ -n "$line" ] || return 1
+  printf '%s' "$line"
+}
+
+# 原子替换单个口令文件。
+set_pass() {
+  local path=$1 pass=$3
+  local tmp="${path}.tmp.$$"
+  umask 077
+  printf '%s\n' "$pass" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+# 口令文件路径：超管用 pgpass，其他角色用 pgpass-<role>。
+passpath() {
+  if [ "$1" = "$PG_OWNER" ]; then printf '%s\n' "$PG_PASS"
+  else printf '%s/pgpass-%s\n' "$(dirname "$PG_PASS")" "$1"; fi
+}
+
+# 以口令文件中的口令经 SCRAM 连接（psql -w 表示绝不交互提示口令）。
+# 口令经环境变量 PGPASSWORD 传给 psql：它不会进入 ps 可见的命令行，也不会写进
+# 任何文件；本会话的 ~/.pgpass 是只读挂载，因此不能依赖 pgpass 文件。
+run_as() { # $1=口令文件 $2=角色 $3=库名 其余=psql 参数
+  local passfile=$1 role=$2 db=$3 pass; shift 3
+  pass="$(read_pass "$passfile")" || die "缺少口令文件：$passfile"
+  env -u PGPASSFILE -u PGDATABASE -u PGHOST -u PGPORT -u PGUSER -u PGSERVICE -u PGOPTIONS \
+      PGHOST="$PG_SOCKDIR" PGPORT="$PG_PORT" PGUSER="$role" PGDATABASE="$db" \
+      PGCONNECT_TIMEOUT=5 PGPASSWORD="$pass" PGAPPNAME='chatbi-pg-script' \
+      "$PSQL_BIN" -w -X -A -t -v ON_ERROR_STOP=1 "$@"
+  local rc=$?
+  pass=''
+  return $rc
+}
+
+# ------------------------------------------------------------------ 配置 --
+spec_text() {
+  cat <<EOF
+pg_major=$PG_MAJOR
+pg_version=$PG_EXPECTED_VERSION
+port=$PG_PORT
+listen_addresses=$PG_LISTEN
+password_encryption=scram-sha-256
+unix_socket_directories=$PG_SOCKDIR
+unix_socket_permissions=0700
+encoding=UTF8
+locale=C
+superuser=$PG_OWNER
+database=$PG_DB
+shared_buffers=64MB
+work_mem=4MB
+max_connections=12
+hba=local-socket-scram
+EOF
+}
+
+write_pg_conf() {
+  local conf="$PG_DATA/postgresql.conf"
+  local had=0
+  # 用变量而不是 `grep ... && had=1`：后者在 set -e 下会成为函数的最后一条命令。
+  if [ -f "$conf" ] && grep -q 'chatbi-poc managed block' "$conf"; then had=1; fi
+  if [ "$had" -eq 0 ]; then
+    cat >> "$conf" <<EOF
+
+# chatbi-poc managed block（scripts/pg 生成，手工修改会被 init 覆盖）
+listen_addresses = $PG_LISTEN
+port = $PG_PORT
+unix_socket_directories = '$PG_SOCKDIR'
+unix_socket_permissions = 0700
+password_encryption = scram-sha-256
+shared_buffers = 64MB
+work_mem = 4MB
+maintenance_work_mem = 16MB
+max_connections = 12
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql.log'
+log_rotation_size = 10MB
+log_connections = off
+log_disconnections = off
+log_statement = 'none'
+log_min_duration_statement = -1
+log_line_prefix = '%m [%p] '
+log_error_verbosity = default
+log_timezone = 'UTC'
+timezone = 'UTC'
+datestyle = 'iso, mdy'
+lc_messages = 'C'
+lc_monetary = 'C'
+lc_numeric = 'C'
+lc_time = 'C'
+default_text_search_config = 'pg_catalog.simple'
+ssl = off
+EOF
+  fi
+}
+
+write_hba() {
+  cat > "$PG_DATA/pg_hba.conf" <<'EOF'
+# chatbi-poc：仅 Unix socket（listen_addresses=''），本地全部走 SCRAM-SHA-256。
+# 角色口令文件由 scripts/pg 生成：var/run/secrets/pgpass*（0600）。
+local   all   all                       scram-sha-256
+local   replication all                 reject
+host    all   all   0.0.0.0/0           reject
+host    all   all   ::/0                reject
+host    replication all 0.0.0.0/0       reject
+host    replication all ::/0            reject
+EOF
+  chmod 0600 "$PG_DATA/pg_hba.conf"
+}
+
+write_spec() {
+  spec_text > "$PG_SPEC"
+  chmod 0600 "$PG_SPEC"
+}
+
+spec_matches() {
+  [ -f "$PG_SPEC" ] && [ "$(spec_text | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$PG_SPEC" | cut -d' ' -f1)" ]
+}
+
+write_state() {
+  umask 077
+  cat > "$PG_STATE" <<EOF
+DATA_DIRECTORY='$PG_DATA'
+SOCKET_DIR='$PG_SOCKDIR'
+PORT=$PG_PORT
+SUPERUSER='$PG_OWNER'
+DATABASE='$PG_DB'
+CLUSTER_ID='$(cat "$(cluster_id_file)" 2>/dev/null || true)'
+DEB_SHA256='$PG_DEB_SHA256'
+EOF
+  chmod 0600 "$PG_STATE"
+}
+
+# 数据目录归属校验（在下载/解包任何软件之前执行）：
+#   * 已有数据目录时，必须带本脚本写的 CHATBI_CLUSTER 且 cluster.env 指向同一目录；
+#   * 目录非空却没有 PG_VERSION，视为外来内容，拒绝。
+guard_existing_data_dir() {
+  if [ -e "$PG_DATA/PG_VERSION" ]; then
+    is_our_cluster || die "已存在非本脚本初始化的数据目录：$PG_DATA（拒绝覆盖或重置）"
+  elif [ -e "$PG_DATA" ] && [ -n "$(ls -A "$PG_DATA" 2>/dev/null || true)" ]; then
+    die "数据目录非空且缺少 PG_VERSION：$PG_DATA（拒绝覆盖）"
+  fi
+  # 已有集群：若调用方用 CHATBI_PG_EXPECT_CLUSTER 声明了期望标识，必须一致
+  # （防止误连到同名目录下的另一个集群）。未声明时不额外限制。
+  if [ -e "$PG_DATA/PG_VERSION" ] && [ -n "${CHATBI_PG_EXPECT_CLUSTER:-}" ]; then
+    [ "$(cat "$(cluster_id_file)" 2>/dev/null || true)" = "$CHATBI_PG_EXPECT_CLUSTER" ] \
+      || die "集群标识与期望值不一致（$PG_DATA）：拒绝操作"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- 子命令 --
+cmd_dist() {
+  ensure_dist
+}
+
+cmd_init() {
+  # 先校验数据目录归属，再准备软件：对“别人的”数据目录不得先下载或解包。
+  check_layout_safety
+  guard_existing_data_dir
+
+  if [ -e "$PG_DATA/PG_VERSION" ]; then
+    is_our_cluster || die "已存在非本脚本初始化的数据目录：$PG_DATA（拒绝覆盖或重置）"
+    log "数据目录已初始化：$PG_DATA，沿用原集群（不重置）"
+  else
+    mkdir -p "$PG_SOCKDIR"; chmod 0700 "$PG_SOCKDIR"
+    mkdir -p "$PG_DATA"; chmod 0700 "$PG_DATA"
+    local pwid; pwid="$(gen_secret)"
+    local pwsvc; pwsvc="$(gen_secret)"
+    local pwfile; pwfile="$(umask 077; mktemp "$PG_ROOT/.initpw.XXXXXX")"
+    chmod 0600 "$pwfile"
+    printf '%s\n' "$pwid" > "$pwfile"
+    (
+      env -u PGPASSWORD -u PGPASSFILE -u PGHOST -u PGPORT -u PGUSER -u PGDATABASE \
+          -u PGOPTIONS -u PGSERVICE \
+      "$PG_BIN/initdb" -D "$PG_DATA" -L "$PG_SHARE" \
+        -U "$PG_OWNER" --pwfile="$pwfile" --auth-local=scram-sha-256 \
+        --auth-host=scram-sha-256 --encoding=UTF8 --locale=C \
+        --no-instructions
+    ) > "$PG_LOG.initdb" 2>&1 || { rm -f "$pwfile"; die "initdb 失败，详见 $PG_LOG.initdb"; }
+    touch_log; cat "$PG_LOG.initdb" >> "$PG_LOG"; rm -f "$PG_LOG.initdb"
+    rm -f "$pwfile"
+    log "initdb 完成：$(cat "$PG_DATA/PG_VERSION") 编码/地区见 $PG_DATA/postgresql.conf"
+
+    write_passfile "$PG_PASS" "$PG_OWNER" "$pwid"
+    write_passfile "$PG_PASS_SVC" "$PG_SVC_ROLE" "$pwsvc"
+    pwid=''; pwsvc=''
+
+    write_pg_conf
+    write_hba
+    head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$(cluster_id_file)"
+    chmod 0600 "$(cluster_id_file)"
+    write_spec
+    write_state
+
+    # 启动 → 校验 data_directory 与 pid → 建库与角色 → 停回初始状态，
+    # 得到完整可用的独立集群。启动/停止在子进程里完成，不残留 postmaster。
+    start_cluster
+    create_objects
+    stop_cluster
+  fi
+
+  # 幂等：配置与角色口令始终与本地口令文件保持一致。
+  write_pg_conf
+  write_hba
+  write_spec
+  write_state
+  # init 的目的之一就是让实例可用：未在监听时启动（幂等）；已在运行时补齐
+  # 库对象、授权与角色口令（均幂等）。
+  if ! instance_up; then
+    log "实例未在监听，启动并核对"
+    start_cluster
+  fi
+  create_objects
+  sync_role_passwords
+  cmd_status
+}
+
+# 等本实例真正接受连接（socket 文件出现 ≠ 目录已创建）。
+await_server() {
+  local i out
+  for i in $(seq 1 30); do
+    if out="$(run_as "$PG_PASS" "$PG_OWNER" postgres -c 'select 1' 2>&1)"; then return 0; fi
+    case "$out" in
+      *"the database system is starting up"*|*"the database system is shutting down"*)
+        sleep 0.5 ;;
+      *) return 0 ;;
+    esac
+  done
+  die "等待 PostgreSQL 就绪超时（详见 $PG_LOG）"
+}
+
+create_objects() {
+  local q
+  # 角色已存在时只轮换口令，保证与本地口令文件一致。
+  local pass; pass="$(read_pass "$PG_PASS_SVC")" || die "缺少服务角色口令文件"
+  local q
+  if [ -z "$(run_as "$PG_PASS" "$PG_OWNER" postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$PG_SVC_ROLE'")" ]; then
+    q="CREATE ROLE $PG_SVC_ROLE LOGIN PASSWORD '$pass'"
+  else
+    q="ALTER ROLE $PG_SVC_ROLE LOGIN PASSWORD '$pass'"
+  fi
+  run_as "$PG_PASS" "$PG_OWNER" postgres -c "$q" >/dev/null || die "创建/更新角色 $PG_SVC_ROLE 失败"
+  pass=''
+
+  run_as "$PG_PASS" "$PG_OWNER" postgres -c "REVOKE ALL ON DATABASE postgres FROM PUBLIC;" >/dev/null
+  # 运行期诊断（scripts/pg status）要读服务端设置；普通角色默认无权查看。
+  # 只授予“查看设置”的预定义角色，不含任何数据访问权限。
+  if [ -z "$(run_as "$PG_PASS" "$PG_OWNER" postgres -c \
+      "SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid \
+        JOIN pg_roles u ON u.oid = m.member WHERE r.rolname = 'pg_read_all_settings' \
+        AND u.rolname = '$PG_SVC_ROLE'")" ]; then
+    run_as "$PG_PASS" "$PG_OWNER" postgres -c "GRANT pg_read_all_settings TO $PG_SVC_ROLE;" >/dev/null
+  fi
+  if [ -z "$(run_as "$PG_PASS" "$PG_OWNER" postgres -c "SELECT 1 FROM pg_database WHERE datname='$PG_DB'")" ]; then
+    run_as "$PG_PASS" "$PG_OWNER" postgres -c "CREATE DATABASE $PG_DB OWNER $PG_OWNER ENCODING 'UTF8' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'" >/dev/null
+    log "已创建数据库 $PG_DB（owner=$PG_OWNER）"
+  fi
+  await_server
+  run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c "REVOKE ALL ON DATABASE $PG_DB FROM PUBLIC;" >/dev/null
+  run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c "GRANT CONNECT ON DATABASE $PG_DB TO $PG_OWNER, $PG_SVC_ROLE;" >/dev/null
+  local ver_num
+  ver_num="$(run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c 'SHOW server_version_num')"
+  [ "$ver_num" = "$PG_EXPECTED_NUM" ] || die "server_version_num=$ver_num != $PG_EXPECTED_NUM"
+}
+
+sync_role_passwords() {
+  data_directory_ok || return 0
+  local pid
+  pid="$(running_pid)" || return 0
+  local pwsvc q
+  pwsvc="$(read_pass "$PG_PASS_SVC")" || return 0
+  # 角色尚不存在（首次初始化、库对象还没建）时静默跳过，由 create_objects 创建。
+  if [ -z "$(run_as "$PG_PASS" "$PG_OWNER" postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$PG_SVC_ROLE'" || true)" ]; then
+    return 0
+  fi
+  # password_encryption=scram-sha-256 已在 postgresql.conf 固定；再次设置以防运行期被改。
+  run_as "$PG_PASS" "$PG_OWNER" postgres \
+    -c "SET password_encryption = 'scram-sha-256'" \
+    -c "ALTER ROLE $PG_SVC_ROLE LOGIN PASSWORD '$pwsvc'" >/dev/null \
+    || log "警告：同步角色口令失败（继续，后续 doctor 会显示连接状态）"
+  pwsvc=''
+}
+
+
+# 启动并校验（不含状态打印）。
+start_cluster() {
+  check_layout_safety
+  guard_existing_data_dir
+  is_our_cluster || die "请先运行 scripts/pg init（$PG_DATA 不是本脚本初始化的集群）"
+  ensure_dist
+  mkdir -p "$PG_SOCKDIR"; chmod 0700 "$PG_SOCKDIR"
+  [ "$(realpath -m "$(read_state && echo "$DATA_DIRECTORY")")" = "$(realpath -m "$PG_DATA")" ] \
+    || die "cluster.env 中的 data_directory 与脚本布局不符，拒绝启动"
+  [ -O "$PG_DATA" ] || die "数据目录属主不是当前用户：$PG_DATA"
+
+  # 在运行 = 本实例接受连接（跨会话、pid 文件由谁写都不影响判断）。
+  local pid
+  if instance_up; then
+    pid="$(running_pid || true)"
+    log "已在运行${pid:+ pid=$pid}"
+    sync_role_passwords
+    return 0
+  fi
+
+  local foreign; foreign="$(foreign_listener || true)"
+  case "$foreign" in
+    LIVE:*)
+      pid="${foreign#LIVE:}"
+      log "端口锁显示本数据目录的 postmaster（PID $pid）仍在；等待接受连接"
+      await_server
+      instance_up || explain_start_failure
+      log "已在运行 pid=$pid（postmaster.pid 缺失，已按端口锁确认）"
+      sync_role_passwords
+      return 0 ;;
+    other-*)
+      die "socket 端口 $PG_PORT 被其它实例占用（$foreign），拒绝启动" ;;
+  esac
+  if [ -n "$foreign" ] || [ -e "$PG_SOCKDIR/.s.PGSQL.$PG_PORT" ]; then
+    log "实例未在监听：清理残留 socket/端口锁"
+  fi
+
+  # 清理残留：本数据目录的 postmaster.pid（实例已确认不在监听）与 socket 文件。
+  if [ -f "$PG_DATA/postmaster.pid" ]; then
+    log "清理陈旧 postmaster.pid"
+  fi
+  clear_stale_runtime_files
+
+  # 固定参数启动（会立即脱离终端）；这里先停稳上一次的进程（如果有），
+  # 避免新 postmaster 在旧进程尚未释放共享内存/端口时启动失败。
+  local oldumask; oldumask="$(umask)"
+  touch_log
+  umask 077
+  if ! PG_CTL_OUT="$(pg_ctl_start)"; then
+    umask "$oldumask"
+    sleep 0.5
+    if ! PG_CTL_OUT="$(pg_ctl_start)"; then
+      umask "$oldumask"
+      printf '%s\n' "$PG_CTL_OUT" >&2
+      explain_start_failure
+    fi
+    umask "$oldumask"
+  fi
+  umask "$oldumask"
+
+  await_server
+  instance_up || explain_start_failure
+  [ -S "$PG_SOCKDIR/.s.PGSQL.$PG_PORT" ] || die "未创建 socket：$PG_SOCKDIR/.s.PGSQL.$PG_PORT"
+  log "已启动 pid=$(running_pid || echo unknown)"
+  sync_role_passwords
+  instance_up || die "启动后无法连接，详见 $PG_LOG"
+  return 0
+}
+
+# 停止后的收尾：等到实例不再接受连接，清掉 socket 与端口锁。
+await_stop() {
+  local i
+  for i in $(seq 1 300); do
+    instance_up || break
+    sleep 0.1
+  done
+  instance_up && die "停止后仍可连接（详见 $PG_LOG）"
+  rm -f "$PG_SOCKDIR/.s.PGSQL.$PG_PORT" "$PG_SOCKDIR/.s.PGSQL.$PG_PORT.lock"
+}
+
+# 停止失败时按原因给出可执行的指令；数据文件不动。第二个判断分支只看
+# pg_ctl 自己的输出——“still in use”字样也可能出现在本文件其它运行轨迹里。
+stop_failed() { # $1=pid(可能未知) $2=日志 $3=是否受限沙箱(0/1)
+  local pid=$1 logf=$2 sandbox=$3 tail_text
+  tail_text="$(tail -n 3 "$logf" 2>/dev/null || true)"
+  if [ "$sandbox" = 1 ]; then
+    die "停止失败：本会话看不到 postmaster（PID ${pid:-${pidfile_pid:-?}}，由其它会话/命名空间启动，沙箱会话结束时会自动回收）。请在启动它的会话执行 scripts/pg stop；数据未改动。日志：$logf"
+  fi
+  case "$PG_CTL_OUT" in
+    *"No such process"*|*"not running"*)
+      # 现象：pid 文件里的 postmaster 在本会话看不到（另一个会话启动的实例）。
+      # 禁止再自动启动（同一数据目录启动不了），只能由能看见进程的会话停止。
+      die "停止失败：无法向 postmaster（PID $pid）发送停止信号——它由另一个会话/命名空间启动，本会话看不到该进程。请在该会话执行 scripts/pg stop，或由能看见它的管理员停止后重试；数据未改动。日志：$logf" ;;
+    *"still in use"*|*"pre-existing shared memory"*)
+      die "停止失败：postmaster 进程仍持有共享内存（PID $pid），请重试或在其会话发送 TERM。日志：$logf" ;;
+  esac
+  die "停止失败（PID $pid），详见 $logf"
+}
+
+# 以固定参数启动（pg_ctl 直接以守护方式拉起 postmaster，不经过 shell）。
+pg_ctl_start() {
+  env PGOPTIONS="-c lock_timeout=10000" \
+    "$PG_BIN/pg_ctl" -D "$PG_DATA" -l "$PG_LOG" -w -t 60 start -s 2>&1
+}
+
+# 启动失败时给出可执行的判断：共享内存残留（9 号进程）、日志尾行。
+explain_start_failure() {
+  local tail_text
+  tail_text="$(tail -n 5 "$PG_LOG" 2>/dev/null || true)$PG_CTL_OUT"
+  case "$PG_CTL_OUT" in
+    *"Operation not permitted"*|*"not permitted"*|*"fork"*|*"detach"*|*"setsid"*)
+      die "启动失败：本会话不允许 postmaster 脱离终端常驻（$PG_CTL_OUT）。请在可常驻后台的会话运行 scripts/pg start；数据未改动。" ;;
+  esac
+  case "$tail_text" in
+    *"pre-existing shared memory block"*|*"still in use"*|*"Is another postmaster"*)
+      die "启动失败：本机可见范围内仍有同端口的 postmaster 残留（日志：$PG_LOG）。请先向其发送 TERM 并等待退出后重试；数据未改动。" ;;
+  esac
+  die "启动失败，详见 $PG_LOG"
+}
+
+cmd_start() {
+  start_cluster "$@"
+  cmd_status
+}
+
+
+# 停止并等待 postmaster 退出（不含摘要）。
+stop_cluster() {
+  if ! data_directory_ok; then
+    log "无数据目录，无需停止"
+    return 0
+  fi
+  is_our_cluster || die "数据目录不属于本脚本，拒绝停止：$PG_DATA"
+  if ! instance_up; then
+    # 实例没在监听：pid 文件若有，只可能是已退出进程的残留（pid 文件第二行必须
+    # 是本数据目录，否则整份文件都不是本脚本写的，留着不动）。
+    clear_stale_runtime_files
+    log "未在运行"
+    return 0
+  fi
+  local pid pidfile_pid oldumask
+  pid="$(running_pid || true)"
+  pidfile_pid="$(head -n1 "$PG_DATA/postmaster.pid" 2>/dev/null | tr -dc '0-9' || true)"
+  # pid 只用于诊断信息：停止由 pg_ctl 的 fast stop 完成（TERM 发给 postmaster，
+  # 由它回收子进程并正常关闭）。
+  # 受限沙箱：每个会话独立 PID 命名空间，看不见 ≠ 没在运行，这时不做任何断言。
+  local sandbox=0
+  grep -qa -- '--unshare-pid' /proc/1/cmdline 2>/dev/null && sandbox=1
+  if [ -n "$pid" ] && ! pid_visible "$pid"; then pid=''; fi
+  oldumask="$(umask)"; umask 077
+  if ! PG_CTL_OUT="$("$PG_BIN/pg_ctl" -D "$PG_DATA" -w -t 60 -m fast stop -s 2>&1)"; then
+    umask "$oldumask"
+    printf '%s\n' "$PG_CTL_OUT" >&2
+    stop_failed "${pid:-${pidfile_pid:-unknown}}" "$PG_LOG" "$sandbox"
+  fi
+  umask "$oldumask"
+  await_stop
+  clear_stale_runtime_files
+}
+
+# 清理本脚本自己留下的运行期残留：postmaster.pid（第二行等于本数据目录才删）、
+# socket 文件与端口锁。只在实例已确认不在监听时调用。
+clear_stale_runtime_files() {
+  if [ -f "$PG_DATA/postmaster.pid" ] \
+     && [ "$(sed -n '2p' "$PG_DATA/postmaster.pid" 2>/dev/null)" = "$PG_DATA" ]; then
+    rm -f "$PG_DATA/postmaster.pid"
+  fi
+  rm -f "$PG_SOCKDIR/.s.PGSQL.$PG_PORT" "$PG_SOCKDIR/.s.PGSQL.$PG_PORT.lock"
+}
+
+cmd_stop() {
+  stop_cluster "$@"
+  log "已停止"
+}
+
+# 空库重建/迁移专用（普通流程永不需要）：集群丢失或损坏、需要按全新空库重建时，
+# 显式声明 CHATBI_PG_EXPECT_CLUSTER=<lost id> 并加 --force-loss，才会把这个
+# 数据目录与口令文件移走（改名保留在 var/pg/lost-<时间>/，不删除、不覆盖任何
+# 非本脚本的目录），随后可重新 init。生产中应改为“先人工确认、再手工移走”。
+cmd_reset() {
+  [ "${1:-}" = "--force-loss" ] || die "用法：CHATBI_PG_EXPECT_CLUSTER=<旧标识> scripts/pg reset --force-loss"
+  [ -n "${CHATBI_PG_EXPECT_CLUSTER:-}" ] || die "reset 必须同时声明 CHATBI_PG_EXPECT_CLUSTER=<旧标识>"
+  check_layout_safety
+  if instance_up; then die "实例仍在运行：先 scripts/pg stop"; fi
+  if [ -e "$PG_DATA/PG_VERSION" ] && is_our_cluster; then
+    [ "$(cat "$(cluster_id_file)")" = "$CHATBI_PG_EXPECT_CLUSTER" ] \
+      || die "集群标识与 CHATBI_PG_EXPECT_CLUSTER 不一致，拒绝 reset"
+  fi
+  local stamp keep
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  keep="$PG_ROOT/lost-$stamp"
+  mkdir -p "$keep"; chmod 0700 "$keep"
+  if [ -e "$PG_DATA" ]; then mv "$PG_DATA" "$keep/data"; fi
+  local f
+  for f in postmaster.pid spec.sha256 cluster.env CHATBI_CLUSTER; do
+    [ -e "$PG_ROOT/$f" ] && mv "$PG_ROOT/$f" "$keep/"
+  done
+  local sec
+  for sec in pgpass pgpass-svc; do
+    [ -e "$ROOT/var/run/secrets/$sec" ] && mv "$ROOT/var/run/secrets/$sec" "$keep/"
+  done
+  clear_stale_runtime_files
+  log "旧集群已移到 $keep（未删除）；请重新运行 scripts/pg init"
+}
+
+cmd_status() {
+  local ver pid up=no
+  ver="$(have postgres && "$PG_BIN/postgres" --version || echo '未安装')"
+  printf 'binary       %s\n' "$ver"
+  printf 'data_dir     %s\n' "$PG_DATA"
+  printf 'socket_dir   %s (port %s, listen_addresses=%s)\n' "$PG_SOCKDIR" "$PG_PORT" "$PG_LISTEN"
+  instance_up && up=yes
+  printf 'state        %s\n' "$([ "$up" = yes ] && echo running || echo 'not accepting connections')"
+  if [ "$up" = yes ]; then
+    # pid 只在本会话能看到该进程、且命令行确实是本数据目录时展示（沙箱会话之间
+    # 互相看不到进程，pid 文件里残留的数字会被回收后复用，不能当作 pid 汇报）。
+    pid="$(running_pid || true)"
+    printf 'pid          %s\n' "${pid:-unknown（本会话看不到 postmaster 进程）}"
+  else
+    printf 'pid          -\n'
+  fi
+  if [ -f "$(cluster_id_file)" ]; then
+    printf 'cluster_id   %s\n' "$(cat "$(cluster_id_file)")"
+  fi
+  if [ "$up" = yes ]; then
+    run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c \
+      "SELECT 'server_version=' || current_setting('server_version')
+           || ' server_version_num=' || current_setting('server_version_num')
+           || ' datname=' || current_database()
+           || ' superuser=' || current_user"
+    run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c \
+      "SELECT 'listen_addresses=' || current_setting('listen_addresses', true)"
+    run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c \
+      "SELECT 'shared_buffers=' || current_setting('shared_buffers')
+           || ' work_mem=' || current_setting('work_mem')
+           || ' max_connections=' || current_setting('max_connections')
+           || ' password_encryption=' || current_setting('password_encryption')"
+    # 诊断用：数据目录与本次启动时间（便于核对“确实重启过”）。
+    run_as "$PG_PASS" "$PG_OWNER" "$PG_DB" -c \
+      "SELECT 'data_dir=' || current_setting('data_directory')
+           || ' started=' || pg_postmaster_start_time()"
+  fi
+}
+
+cmd_sql() {
+  [ $# -ge 1 ] || die "用法：scripts/pg sql 'SQL'"
+  running_pid >/dev/null || die "PostgreSQL 未运行（先 scripts/pg start）"
+  local role="${CHATBI_PG_ROLE:-$PG_SVC_ROLE}" passfile="$PG_PASS_SVC"
+  if [ "$role" != "$PG_SVC_ROLE" ]; then
+    passfile="$PG_PASS"
+    read_pass "$passfile" >/dev/null || die "角色 $role 没有本地口令（scripts/pg password --role $role）"
+  fi
+  run_as "$passfile" "$role" "$PG_DB" -c "$1"
+}
+
+cmd_pid() {
+  running_pid || { echo "not running" >&2; return 1; }
+}
+
+cmd_passfile() {
+  printf '%s\n' "$PG_PASS"
+}
+
+cmd_password() {
+  local role="${1:-$PG_SVC_ROLE}"
+  running_pid >/dev/null || die "PostgreSQL 未运行"
+  if [ "$role" = "$PG_OWNER" ]; then
+    read_pass "$PG_PASS" || die "无 $PG_OWNER 口令"
+    return 0
+  fi
+  local pass; pass="$(gen_secret)"
+  local q="ALTER ROLE $role LOGIN PASSWORD '$pass'"
+  run_as "$PG_PASS" "$PG_OWNER" postgres -c "$q" >/dev/null || die "轮换角色 $role 口令失败"
+  set_pass "$(passpath "$role")" "$pass"
+  printf '%s\n' "$pass"
+}
+
+cmd_which() {
+  printf '{"bin":"%s","postgres":"%s","initdb":"%s","pg_ctl":"%s","psql":"%s"}\n' \
+    "$PG_BIN" "$PG_BIN/postgres" "$PG_BIN/initdb" "$PG_BIN/pg_ctl" "$PSQL_BIN"
+}
+
+usage() {
+  # 打印文件头的用法注释（从第 2 行起到第一个空注释后的空行为止）。
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+
+# 客户端：优先用解包目录下的同版本 psql；Debian 的服务器包不含 psql，
+# 因此回退到系统客户端（本机为 17.12）。版本不符时在 cmd_which 里可见。
+PSQL_BIN=""
+resolve_psql() {
+  if [ -x "$PG_BIN/psql" ]; then PSQL_BIN="$PG_BIN/psql"
+  elif command -v psql >/dev/null 2>&1; then PSQL_BIN="$(command -v psql)"
+  else die "未找到 psql 客户端（系统需安装 PostgreSQL 17 客户端）"; fi
+}
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+cmd=$1; shift
+# reset 不需要 psql；其它子命令先解析客户端（找不到时直接报错，而不是走 usage）。
+[ "$cmd" = reset ] || resolve_psql
+case "$cmd" in
+  init)     cmd_init "$@" ;;
+  start)    cmd_start "$@" ;;
+  status)   cmd_status "$@" ;;
+  sql)      cmd_sql "$@" ;;
+  stop)     cmd_stop "$@" ;;
+  reset)    cmd_reset "$@" ;;
+  dist)     cmd_dist "$@" ;;
+  pid)      cmd_pid "$@" ;;
+  passfile) cmd_passfile "$@" ;;
+  password) cmd_password "$@" ;;
+  which)    cmd_which "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

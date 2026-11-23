@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# 从锁文件建立同版本环境：uv sync --frozen + 创建 var 子目录（0700）+ 记录环境摘要。
+#
+# 用法：bash scripts/bootstrap [--no-sync] [--no-verify-db]
+#   --no-sync        只建目录、写 bootstrap 记录，不执行 uv sync（离线复验用）
+#   --no-verify-db   不在 PostgreSQL 实例可用时核对库对象（默认可用时核对）
+#
+# 幂等：可重复执行；不重置已有集群、数据库或依赖。uv 缓存由 pyproject 的
+# [tool.uv] cache-dir 固定到 var/.uvcache；该目录不可写（如受限会话）时退回到
+# 本次运行的临时缓存，并在输出中说明。
+# 安全：本脚本从不读取、打印或写入 CHATBI_LLM_API_KEY，只记录其是否存在。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+DO_SYNC=1
+VERIFY_DB=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-sync) DO_SYNC=0 ;;
+    --no-verify-db) VERIFY_DB=0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "bootstrap: 未知参数 $arg" >&2; exit 2 ;;
+  esac
+done
+
+log() { printf '[bootstrap] %s\n' "$*"; }
+die() { printf '[bootstrap] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- 1) var 目录 --
+# 私有目录 0700：pg（软件/集群）、run（运行期文件与口令）、stage、audit、
+# approvals、evidence；var/.uvcache 是依赖缓存，只需属主可写。
+mkdir -p "$ROOT/var"
+for d in pg run stage audit approvals evidence; do
+  install -d -m 0700 "$ROOT/var/$d"
+done
+install -d -m 0700 "$ROOT/var/run/secrets"   # pgpass 等仅属主可读文件
+
+# ------------------------------------------------------------ 2) uv 缓存位置 --
+# 先按 pyproject 的 cache-dir 尝试；不可写时改用本次运行的临时缓存。
+CACHE_NOTE=""
+probe_cache() {
+  local dir=$1
+  mkdir -p "$dir" 2>/dev/null || return 1
+  local f="$dir/.bootstrap-probe.$$"
+  ( : > "$f" ) 2>/dev/null && rm -f "$f"
+}
+if ! probe_cache "$ROOT/var/.uvcache"; then
+  ALT_CACHE="${TMPDIR:-/tmp}/chatbi-uv-cache-$(id -u)"
+  probe_cache "$ALT_CACHE" || die "uv 缓存目录均不可写：var/.uvcache 与 $ALT_CACHE"
+  export UV_CACHE_DIR="$ALT_CACHE"
+  CACHE_NOTE="var/.uvcache 不可写，改用 UV_CACHE_DIR=$ALT_CACHE"
+  log "$CACHE_NOTE"
+fi
+
+# ------------------------------------------------------------- 3) 依赖同步 --
+FROZEN=0
+if [ "$DO_SYNC" -eq 1 ]; then
+  command -v uv >/dev/null 2>&1 || die "未找到 uv（需要 uv 0.13.x）"
+  log "$(uv --version)"
+  [ -f uv.lock ] || die "缺少 uv.lock"
+  log "uv sync --frozen（只用锁文件，不解析、不升级）"
+  uv sync --frozen || die "uv sync --frozen 失败；检查网络或 uv 缓存"
+  FROZEN=1
+fi
+
+PY_BIN="$ROOT/.venv/bin/python"
+[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"
+"$PY_BIN" - <<'PY' || die "Python 版本或直接依赖不符合总体设计（先 uv sync --frozen）"
+import importlib.metadata as m, sys
+want = {
+    "openpyxl": "3.1.5", "psycopg": "3.2.9", "fastapi": "0.116.1",
+    "uvicorn": "0.35.0", "PyYAML": "6.0.2", "sqlglot": "27.8.0", "httpx": "0.28.1",
+}
+if sys.version_info[:3] != (3, 13, 5):
+    sys.exit(f"python {sys.version.split()[0]} != 3.13.5")
+have = {}
+for k in want:
+    try:
+        have[k] = m.version(k)
+    except m.PackageNotFoundError:
+        have[k] = None
+bad = {k: have[k] for k in want if have[k] != want[k]}
+if bad:
+    sys.exit(f"依赖版本不符：{bad}")
+PY
+
+# ------------------------------------------------------- 4) 环境摘要（无凭据） --
+BOOK="data/江海智造_2026Q3_经营财务模拟数据.xlsx"
+BOOK_SHA=""
+[ -f "$BOOK" ] && BOOK_SHA="$(sha256sum "$BOOK" | cut -d' ' -f1)"
+LOCK_SHA="$(sha256sum uv.lock | cut -d' ' -f1)"
+PYTEST_BIN="$ROOT/.venv/bin/pytest"
+PYTEST_VERSION=""
+if [ -x "$PYTEST_BIN" ]; then PYTEST_VERSION="$("$PY_BIN" -c 'import importlib.metadata as m;print(m.version("pytest"))' 2>/dev/null || true)"; fi
+LLM_PRESENT=false
+if [ -n "${CHATBI_LLM_API_KEY:-}" ]; then LLM_PRESENT=true; fi
+
+umask 077
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+REC="$ROOT/var/run/bootstrap.json"
+cat > "$REC.tmp.$$" <<EOF
+{
+  "frozen": $([ "$FROZEN" -eq 1 ] && echo true || echo false),
+  "uv_version": "$(uv --version 2>/dev/null || echo unknown)",
+  "uv_cache_note": "${CACHE_NOTE}",
+  "python": "$("$PY_BIN" -c 'import platform;print(platform.python_version())')",
+  "python_executable": "$PY_BIN",
+  "pytest": "${PYTEST_VERSION}",
+  "lock": "uv.lock",
+  "lock_sha256": "$LOCK_SHA",
+  "workbook": "$BOOK",
+  "workbook_sha256": "$BOOK_SHA",
+  "llm_api_key_present": $LLM_PRESENT,
+  "timestamp": "$TS"
+}
+EOF
+mv -f "$REC.tmp.$$" "$REC"
+chmod 0600 "$REC"
+
+# --------------------------------------------------- 5) 数据库对象核对（可选） --
+# 用 `chatbi doctor --strict` 判断实例是否就绪（它与 scripts/pg 用同一条 socket
+# 连接判断，跨会话也成立）；未初始化或未启动时只提示，不算失败。
+if [ "$VERIFY_DB" -eq 1 ]; then
+  if "$PY_BIN" -m chatbi.cli doctor --strict >/dev/null 2>&1; then
+    ver="$(bash "$ROOT/scripts/pg" sql 'show server_version_num' 2>/dev/null || true)"
+    [ "$ver" = "170012" ] || die "server_version_num=$ver != 170012"
+    db="$(bash "$ROOT/scripts/pg" sql 'select current_database()' 2>/dev/null || true)"
+    [ "$db" = "chatbi" ] || die "脚本连到的库是 $db，期望 chatbi"
+    log "PostgreSQL 就绪：server_version_num=$ver database=$db"
+  else
+    log "PostgreSQL 未运行或未初始化，跳过库对象核对（scripts/pg init && scripts/pg start）"
+  fi
+fi
+
+log "python=$("$PY_BIN" -V 2>&1) pytest=$PYTEST_VERSION frozen=$FROZEN lock_sha256=${LOCK_SHA:0:12}..."
+log "var 目录就绪（0700）：pg run stage audit approvals evidence"
+log "环境摘要：var/run/bootstrap.json（llm_api_key_present=$LLM_PRESENT）"

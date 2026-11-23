@@ -1,0 +1,61 @@
+{
+  "build_sha": "de0dcf108dea494b0654467561afd36d7efe9ba49890ab0f517dd253ca434039",
+  "batch_id": "none",
+  "operator": "box",
+  "timestamp": "2026-11-23T21:49:35Z",
+  "status": "PASS",
+  "cases": [
+    {
+      "build_sha": "de0dcf108dea494b0654467561afd36d7efe9ba49890ab0f517dd253ca434039",
+      "batch_id": "none",
+      "operator": "box",
+      "timestamp": "2026-11-23T21:47:33Z",
+      "case_id": "S01-AC1",
+      "command": "timeout 300 bash -c 'bash scripts/bootstrap && uv sync --frozen && .venv/bin/chatbi doctor --json'",
+      "exit_code": 0,
+      "expected": "Bootstrap and frozen sync succeed; Python 3.13.5, PostgreSQL binary 17.12, uv 0.13.9, Node 24.22.1 and all direct dependency versions match docs/01-总体设计.md.",
+      "observed": "Command succeeded. Python 3.13.5; PostgreSQL binary 17.12; uv 0.13.9; Node 24.22.1; openpyxl 3.1.5, psycopg 3.2.9, fastapi 0.116.1, uvicorn 0.35.0, PyYAML 6.0.2, sqlglot 27.8.0, httpx 0.28.1; pytest 8.4.1.",
+      "artifact": ["var/run/bootstrap.json", "var/evidence/env.json"],
+      "status": "PASS"
+    },
+    {
+      "build_sha": "de0dcf108dea494b0654467561afd36d7efe9ba49890ab0f517dd253ca434039",
+      "batch_id": "none",
+      "operator": "box",
+      "timestamp": "2026-11-23T21:47:46Z",
+      "case_id": "S01-AC2",
+      "command": "timeout 300 bash -c 'scripts/pg init; scripts/pg start; scripts/pg sql \"show server_version_num\"; read cluster id; scripts/pg init; scripts/pg start; compare cluster id; scripts/pg sql \"show listen_addresses\"'",
+      "exit_code": 0,
+      "expected": "server_version_num is 170012; repeated init/start preserves cluster id; listen_addresses is empty.",
+      "observed": "server_version_num=170012; both cluster ids were be37e7ec1973e46080e66cf8eae632b1; listen_addresses returned an empty row; database chatbi accepted authenticated connections.",
+      "artifact": ["var/evidence/env.json"],
+      "status": "PASS"
+    },
+    {
+      "build_sha": "de0dcf108dea494b0654467561afd36d7efe9ba49890ab0f517dd253ca434039",
+      "batch_id": "none",
+      "operator": "box",
+      "timestamp": "2026-11-23T21:48:09Z",
+      "case_id": "S01-AC3",
+      "command": "timeout 300 bash -c 'scripts/pg stop && scripts/pg start && .venv/bin/pytest -q tests/test_s01.py'",
+      "exit_code": 0,
+      "expected": "All step-01 tests pass with no skip or xfail, including restart identity, socket permissions and credential redaction.",
+      "observed": "13 passed in 11.93s; no skip or xfail. Socket and private directories were mode 0700 and pgpass files mode 0600.",
+      "artifact": ["var/evidence/env.json"],
+      "status": "PASS"
+    },
+    {
+      "build_sha": "de0dcf108dea494b0654467561afd36d7efe9ba49890ab0f517dd253ca434039",
+      "batch_id": "none",
+      "operator": "box",
+      "timestamp": "2026-11-23T21:49:08Z",
+      "case_id": "S01-INDEPENDENT-RECHECK",
+      "command": "timeout 180 .venv/bin/pytest -q tests/test_s01.py -k restart_keeps_cluster_id_and_connects; timeout 180 .venv/bin/pytest -q tests/test_s01.py -k pg_guard_rejects_foreign_data_dir",
+      "exit_code": 0,
+      "expected": "One positive restart case and one negative foreign-data-directory guard case each select and pass one test.",
+      "observed": "Positive: 1 passed, 12 deselected. Negative: 1 passed, 12 deselected.",
+      "artifact": ["var/evidence/env.json"],
+      "status": "PASS"
+    }
+  ]
+}

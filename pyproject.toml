@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chatbi"
+version = "0.1.0"
+description = "江海智造问数 POC（本机环境、导入、受限查询与网页）"
+readme = "docs/01-总体设计.md"
+requires-python = ">=3.13,<3.14"
+# 直接依赖固定为总体设计版本表；其余传递依赖由 uv.lock 锁定。
+dependencies = [
+    "openpyxl==3.1.5",
+    "psycopg[binary]==3.2.9",
+    "fastapi==0.116.1",
+    "uvicorn==0.35.0",
+    "PyYAML==6.0.2",
+    "sqlglot==27.8.0",
+    "httpx==0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+]
+
+[project.scripts]
+chatbi = "chatbi.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chatbi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# PG 由 scripts/pg init 生成的口令文件读取，测试不得依赖任何外部环境变量。
+
+[tool.uv]
+# 固定解释器为系统 3.13.5，不从网络下载新的解释器。
+python-preference = "only-system"
+# uv 缓存默认为 ~/.cache/uv；受限会话下该目录只读，统一落到项目内可写的缓存。
+cache-dir = "var/.uvcache"
